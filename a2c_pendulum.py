@@ -19,6 +19,7 @@ import argparse
 import wandb
 from tqdm import tqdm
 from typing import Tuple
+import os
 
 def initialize_uniformly(layer: nn.Linear, init_w: float = 3e-3):
     """Initialize the weights and bias in [-init_w, init_w]."""
@@ -35,14 +36,11 @@ class Actor(nn.Module):
         # Remeber to initialize the layer weights
         self.layer1 = nn.Linear(in_dim, hidden_dim)
         self.layer2 = nn.Linear(hidden_dim, hidden_dim)
-        self.layer_mu = nn.Linear(hidden_dim, out_dim)
-        self.layer_std = nn.Linear(hidden_dim, out_dim)
-        
-        # Initialize weights
-        initialize_uniformly(self.layer1)
-        initialize_uniformly(self.layer2)
-        initialize_uniformly(self.layer_mu)
-        initialize_uniformly(self.layer_std)
+        self.mu_layer = nn.Linear(hidden_dim, out_dim)
+        self.log_std_layer = nn.Linear(hidden_dim, out_dim) # log for stable Learning
+
+        initialize_uniformly(self.mu_layer)
+        initialize_uniformly(self.log_std_layer)
         #############################
         
     def forward(self, state: torch.Tensor) -> torch.Tensor:
@@ -53,13 +51,12 @@ class Actor(nn.Module):
         x = F.relu(x)
         x = self.layer2(x)
         x = F.relu(x)
+        mu = torch.tanh(self.mu_layer(x)) * 2 # action space [-2,2]
+        log_std = F.softplus(self.log_std_layer(x)) # softplus >=0
+        std = torch.exp(log_std)
 
-        mu = self.layer_mu(x)
-        std = F.softplus(self.layer_std(x))
         dist = Normal(mu, std)
-
-        action = torch.tanh(dist.rsample()) #using reparameterization trick for backpropagation
-        action *= 2.0  # the action space is [-2, 2]
+        action = dist.sample()
         
         #############################
 
@@ -75,11 +72,9 @@ class Critic(nn.Module):
         # Remeber to initialize the layer weights
         self.layer1 = nn.Linear(in_dim, hidden_dim)
         self.layer2 = nn.Linear(hidden_dim, hidden_dim)
-        self.layer3 = nn.Linear(hidden_dim, 1)
-        # Initialize weights
-        initialize_uniformly(self.layer1)
-        initialize_uniformly(self.layer2)
-        initialize_uniformly(self.layer3)
+        self.out = nn.Linear(hidden_dim, 1)
+
+        initialize_uniformly(self.out)
         #############################
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
@@ -90,7 +85,7 @@ class Critic(nn.Module):
         x = F.relu(x)
         x = self.layer2(x)
         x = F.relu(x)
-        value = self.layer3(x)  # V(s)
+        value = self.out(x)
         #############################
 
         return value
@@ -123,6 +118,7 @@ class A2CAgent:
         self.actor_lr = args.actor_lr
         self.critic_lr = args.critic_lr
         self.num_episodes = args.num_episodes
+        self.hidden_dim = args.hidden_dim
         
         # device: cpu / gpu
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -131,8 +127,8 @@ class A2CAgent:
         # networks
         obs_dim = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
-        self.actor = Actor(obs_dim, action_dim).to(self.device)
-        self.critic = Critic(obs_dim).to(self.device)
+        self.actor = Actor(obs_dim, action_dim, self.hidden_dim).to(self.device)
+        self.critic = Critic(obs_dim, self.hidden_dim).to(self.device)
 
         # optimizer
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.actor_lr)
@@ -146,6 +142,26 @@ class A2CAgent:
 
         # mode: train / test
         self.is_test = False
+        
+        self.best_score = float("-inf")
+        self.model_dir = args.save_dir
+        os.makedirs(self.model_dir, exist_ok=True)
+
+    def save_model(self, epoch: int = None, is_best: bool = False):
+        if is_best:
+            actor_path = os.path.join(self.model_dir, "actor_best.pt")
+            critic_path = os.path.join(self.model_dir, "critic_best.pt")
+            print(f"Saving best model with score {self.best_score:.2f} to {actor_path}")
+        elif epoch is not None and epoch >= 400 and epoch % 100 == 0:
+            actor_path = os.path.join(self.model_dir, f"actor_epoch_{epoch}.pt")
+            critic_path = os.path.join(self.model_dir, f"critic_epoch_{epoch}.pt")
+            print(f"Epoch {epoch}: Saving model to {actor_path}")
+        else:
+            return  
+
+        torch.save(self.actor.state_dict(), actor_path)
+        torch.save(self.critic.state_dict(), critic_path)
+
 
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
@@ -172,6 +188,7 @@ class A2CAgent:
     def update_model(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Update the model by gradient descent."""
         state, log_prob, next_state, reward, done = self.transition
+        next_state = torch.FloatTensor(next_state).to(self.device)
 
         # Q_t   = r + gamma * V(s_{t+1})  if state != Terminal
         #       = r                       otherwise
@@ -179,6 +196,10 @@ class A2CAgent:
         
         ############TODO#############
         # value_loss = ?
+        td_target = reward + self.gamma* self.critic(next_state) * mask
+        state_value = self.critic(state)
+        value_loss = F.smooth_l1_loss(state_value, td_target.detach())   
+        # value_loss = F.mse_loss(state_value, td_target.detach())             
         #############################
 
         # update value
@@ -189,6 +210,8 @@ class A2CAgent:
         # advantage = Q_t - V(s_t)
         ############TODO#############
         # policy_loss = ?
+        advantage = (td_target - state_value).detach()
+        policy_loss = -(log_prob * advantage) - self.entropy_weight * log_prob
         #############################
         # update policy
         self.actor_optimizer.zero_grad()
@@ -234,6 +257,12 @@ class A2CAgent:
                         "episode": ep,
                         "return": score
                         })  
+                    if score >= self.best_score:
+                        self.best_score = score
+                        self.save_model(is_best=True)
+
+                    self.save_model(epoch=ep)
+
 
     def test(self, video_folder: str):
         """Test the agent."""
@@ -257,6 +286,14 @@ class A2CAgent:
         self.env.close()
 
         self.env = tmp_env
+        
+    def load_best_model(self, save_dir: str):
+        actor_path = os.path.join(save_dir, "actor_best.pt")
+        critic_path = os.path.join(save_dir, "critic_best.pt")        
+
+        self.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
+        self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
+        print(f"Loaded model from {actor_path}")
 
 def seed_torch(seed):
     torch.manual_seed(seed)
@@ -272,14 +309,18 @@ if __name__ == "__main__":
     parser.add_argument("--actor-lr", type=float, default=1e-4)
     parser.add_argument("--critic-lr", type=float, default=1e-3)
     parser.add_argument("--discount-factor", type=float, default=0.9)
-    parser.add_argument("--num-episodes", type=float, default=1000)
+    parser.add_argument("--num-episodes", type=float, default=500)
     parser.add_argument("--seed", type=int, default=77)
-    parser.add_argument("--entropy-weight", type=int, default=1e-2) # entropy can be disabled by setting this to 0
+    parser.add_argument("--entropy-weight", type=float, default=1e-2) # entropy can be disabled by setting this to 0
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--save-dir", type=str, default="result/task1/model", help="Directory to save model checkpoints")
+    parser.add_argument("--video-dir", type=str, default="result/task1/video", help="Directory to save test videos")
+
     args = parser.parse_args()
     
     # environment
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
-    seed = 77
+    seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     seed_torch(seed)
@@ -287,3 +328,8 @@ if __name__ == "__main__":
     
     agent = A2CAgent(env, args)
     agent.train()
+    
+    os.makedirs(args.video_dir, exist_ok=True)
+    agent.load_best_model(save_dir=args.save_dir)
+    agent.test(video_folder=args.video_dir)
+

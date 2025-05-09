@@ -1,5 +1,7 @@
 DLP_Lab7_Slides.pdf
 Spring2025_DLP_RL_HW2.pdf
+wandb/
+result/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
