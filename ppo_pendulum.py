@@ -21,6 +21,7 @@ from torch.distributions import Normal
 import argparse
 import wandb
 from tqdm import tqdm
+import os
 
 def init_layer_uniform(layer: nn.Linear, init_w: float = 3e-3) -> nn.Linear:
     """Init uniform parameters on the single layer."""
@@ -37,12 +38,21 @@ class Actor(nn.Module):
         out_dim: int,
         log_std_min: int = -20,
         log_std_max: int = 0,
+        hidden_dim: int = 64
     ):
         """Initialize."""
         super(Actor, self).__init__()
 
         ############TODO#############
         # Remeber to initialize the layer weights
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+        
+        self.layer1 = nn.Linear(in_dim, hidden_dim)
+        # self.layer2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mu_layer = init_layer_uniform(nn.Linear(hidden_dim, out_dim))
+        self.log_std_layer = init_layer_uniform(nn.Linear(hidden_dim, out_dim))
+
         
         #############################
 
@@ -50,6 +60,17 @@ class Actor(nn.Module):
         """Forward method implementation."""
         
         ############TODO#############
+        x = self.layer1(state)
+        x = F.relu(x)
+        # x = self.layer2(x)
+        # x = F.relu(x)
+        mu = torch.tanh(self.mu_layer(x)) * 2 # action space [-2,2]
+        log_std = torch.tanh(self.log_std_layer(x)) # softplus >=0
+        log_std = self.log_std_min + (log_std + 1) * (self.log_std_max - self.log_std_min)/2
+        std = torch.exp(log_std)
+
+        dist = Normal(mu, std)
+        action = dist.sample()
 
         #############################
 
@@ -57,12 +78,15 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, in_dim: int):
+    def __init__(self, in_dim: int, hidden_dim: int = 64):
         """Initialize."""
         super(Critic, self).__init__()
 
         ############TODO#############
         # Remeber to initialize the layer weights
+        self.layer1 = nn.Linear(in_dim, hidden_dim)
+        # self.layer2 = nn.Linear(hidden_dim, hidden_dim)
+        self.out = init_layer_uniform(nn.Linear(hidden_dim, 1))
         
         #############################
 
@@ -70,7 +94,11 @@ class Critic(nn.Module):
         """Forward method implementation."""
         
         ############TODO#############
-
+        x = self.layer1(state)
+        x = F.relu(x)
+        # x = self.layer2(x)
+        # x = F.relu(x)
+        value = self.out(x)
         #############################
 
         return value
@@ -78,9 +106,18 @@ class Critic(nn.Module):
 def compute_gae(
     next_value: list, rewards: list, masks: list, values: list, gamma: float, tau: float) -> List:
     """Compute gae."""
-
-    ############TODO#############
-
+    
+    # ############TODO#############
+    gae = 0
+    gae_returns = []
+    next_v = next_value
+    
+    for reward, value, mask in  zip(reversed(rewards), reversed(values), reversed(masks)):
+        delta = reward + gamma * next_v * mask - value
+        gae = delta + gamma * tau * gae * mask
+        gae_returns.insert(0,gae+value)
+        next_v = value
+        
     #############################
     return gae_returns
 
@@ -143,10 +180,10 @@ class PPOAgent:
         print(self.device)
 
         # networks
-        obs_dim = env.observation_space.shape[0]
+        self.obs_dim = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
-        self.actor = Actor(obs_dim, action_dim).to(self.device)
-        self.critic = Critic(obs_dim).to(self.device)
+        self.actor = Actor(self.obs_dim, action_dim).to(self.device)
+        self.critic = Critic(self.obs_dim).to(self.device)
 
         # optimizer
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=0.001)
@@ -165,6 +202,25 @@ class PPOAgent:
 
         # mode: train / test
         self.is_test = False
+        
+        self.best_score = float("-inf")
+        self.model_dir = args.save_dir
+        os.makedirs(self.model_dir, exist_ok=True)
+
+    def save_model(self, epoch: int = None, is_best: bool = False):
+        if is_best:
+            actor_path = os.path.join(self.model_dir, "actor_best.pt")
+            critic_path = os.path.join(self.model_dir, "critic_best.pt")
+            print(f"Saving best model with score {self.best_score:.2f} to {actor_path}")
+        elif epoch is not None and epoch >= 150 and epoch % 10 == 0:
+            actor_path = os.path.join(self.model_dir, f"actor_epoch_{epoch}.pt")
+            critic_path = os.path.join(self.model_dir, f"critic_epoch_{epoch}.pt")
+            print(f"Epoch {epoch}: Saving model to {actor_path}")
+        else:
+            return  
+
+        torch.save(self.actor.state_dict(), actor_path)
+        torch.save(self.critic.state_dict(), critic_path)
 
     def select_action(self, state: np.ndarray) -> np.ndarray:
         """Select an action from the input state."""
@@ -231,19 +287,26 @@ class PPOAgent:
             # calculate ratios
             _, dist = self.actor(state)
             log_prob = dist.log_prob(action)
-            ratio = (log_prob - old_log_prob).exp()
+            ratio = (log_prob - old_log_prob).exp()          
 
-            # actor_loss
-            ############TODO#############
-            # actor_loss = ?
+            # # actor_loss
+            # ############TODO#############
+            # # actor_loss = ?
+            surrogate = ratio * adv
+            clipped_surrogate = torch.clamp(ratio, 1-self.epsilon, 1+self.epsilon)* adv
             
-            #############################
+            entropy = dist.entropy().mean()
+            actor_loss = (-torch.min(surrogate, clipped_surrogate)).mean() - self.entropy_weight*entropy          
+            
+            # #############################
 
-            # critic_loss
-            ############TODO#############
-            # critic_loss = ?
-
-            #############################
+            # # critic_loss
+            # ############TODO#############
+            # # critic_loss = ?            
+            state_value = self.critic(state)
+            critic_loss = F.mse_loss(state_value, return_)
+            #critic_loss = F.smooth_l1_loss(state_value, return_) 
+            # #############################
             
             # train critic
             self.critic_optimizer.zero_grad()
@@ -286,7 +349,7 @@ class PPOAgent:
                 next_state, reward, done = self.step(action)
 
                 state = next_state
-                score += reward[0][0]
+                score += reward[0][0]        
 
                 # if episode ends
                 if done[0][0]:
@@ -295,11 +358,30 @@ class PPOAgent:
                     state = np.expand_dims(state, axis=0)
                     scores.append(score)
                     print(f"Episode {episode_count}: Total Reward = {score}")
-                    score = 0
+                    # W&B logging
+                    wandb.log({
+                        "episode": episode_count,
+                        "return": score
+                        }, step=self.total_step)  
+      
+                    
+                    if score >= self.best_score:
+                        self.best_score = score
+                        self.save_model(is_best=True)
+
+                    self.save_model(epoch=episode_count)
+                    score = 0             
+
 
             actor_loss, critic_loss = self.update_model(next_state)
             actor_losses.append(actor_loss)
             critic_losses.append(critic_loss)
+            
+            wandb.log({
+                    "step": self.total_step,
+                    "actor loss": actor_loss,
+                    "critic loss": critic_loss,
+                    }, step=self.total_step) 
 
         # termination
         self.env.close()
@@ -322,10 +404,18 @@ class PPOAgent:
             state = next_state
             score += reward
 
-        print("score: ", score)
+        print("score: ", score[0][0])
         self.env.close()
 
         self.env = tmp_env
+    
+    def load_best_model(self, save_dir: str):
+        actor_path = os.path.join(save_dir, "actor_best.pt")
+        critic_path = os.path.join(save_dir, "critic_best.pt")        
+
+        self.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
+        self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
+        print(f"Loaded model from {actor_path}")
  
 def seed_torch(seed):
     torch.manual_seed(seed)
@@ -336,10 +426,10 @@ def seed_torch(seed):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb-run-name", type=str, default="pendulum-ppo-run")
-    parser.add_argument("--actor-lr", type=float, default=1e-4)
-    parser.add_argument("--critic-lr", type=float, default=1e-3)
+    parser.add_argument("--actor-lr", type=float, default=1e-3)
+    parser.add_argument("--critic-lr", type=float, default=5e-3)
     parser.add_argument("--discount-factor", type=float, default=0.9)
-    parser.add_argument("--num-episodes", type=float, default=1000)
+    parser.add_argument("--num-episodes", type=float, default=20)
     parser.add_argument("--seed", type=int, default=77)
     parser.add_argument("--entropy-weight", type=int, default=1e-2) # entropy can be disabled by setting this to 0
     parser.add_argument("--tau", type=float, default=0.8)
@@ -347,6 +437,9 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon", type=int, default=0.2)
     parser.add_argument("--rollout-len", type=int, default=2000)  
     parser.add_argument("--update-epoch", type=float, default=64)
+    parser.add_argument("--save-dir", type=str, default="result/task2/model", help="Directory to save model checkpoints")
+    parser.add_argument("--video-dir", type=str, default="result/task2/video", help="Directory to save test videos")
+
     args = parser.parse_args()
  
     # environment
@@ -359,3 +452,7 @@ if __name__ == "__main__":
     
     agent = PPOAgent(env, args)
     agent.train()
+    
+    os.makedirs(args.video_dir, exist_ok=True)
+    agent.load_best_model(save_dir=args.save_dir)
+    agent.test(video_folder=args.video_dir)

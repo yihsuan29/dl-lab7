@@ -73,7 +73,7 @@ class Critic(nn.Module):
         self.layer1 = nn.Linear(in_dim, hidden_dim)
         self.layer2 = nn.Linear(hidden_dim, hidden_dim)
         self.out = nn.Linear(hidden_dim, 1)
-
+        
         initialize_uniformly(self.out)
         #############################
 
@@ -199,7 +199,7 @@ class A2CAgent:
         td_target = reward + self.gamma* self.critic(next_state) * mask
         state_value = self.critic(state)
         value_loss = F.smooth_l1_loss(state_value, td_target.detach())   
-        # value_loss = F.mse_loss(state_value, td_target.detach())             
+        #value_loss = F.mse_loss(state_value, td_target.detach())             
         #############################
 
         # update value
@@ -257,11 +257,11 @@ class A2CAgent:
                         "episode": ep,
                         "return": score
                         })  
-                    if score >= self.best_score:
-                        self.best_score = score
-                        self.save_model(is_best=True)
+                    # if score >= self.best_score:
+                    #     self.best_score = score
+                    #     self.save_model(is_best=True)
 
-                    self.save_model(epoch=ep)
+                    # self.save_model(epoch=ep)
 
 
     def test(self, video_folder: str):
@@ -329,7 +329,7 @@ if __name__ == "__main__":
     agent = A2CAgent(env, args)
     agent.train()
     
-    os.makedirs(args.video_dir, exist_ok=True)
-    agent.load_best_model(save_dir=args.save_dir)
-    agent.test(video_folder=args.video_dir)
+    # os.makedirs(args.video_dir, exist_ok=True)
+    # agent.load_best_model(save_dir=args.save_dir)
+    # agent.test(video_folder=args.video_dir)
 
