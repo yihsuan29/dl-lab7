@@ -22,6 +22,10 @@ import argparse
 import wandb
 from tqdm import tqdm
 import os
+import re
+
+SUCCESS_REWARD_THRESHOLD = -150
+NUM_SUCCESSFUL_SEEDS = 20
 
 def init_layer_uniform(layer: nn.Linear, init_w: float = 3e-3) -> nn.Linear:
     """Init uniform parameters on the single layer."""
@@ -105,8 +109,11 @@ class Critic(nn.Module):
     
 def compute_gae(
     next_value: list, rewards: list, masks: list, values: list, gamma: float, tau: float) -> List:
-    """Compute gae."""
-    
+    """Compute gae.
+       At = δt + γλδt + 1 + (γλ)^2δt+2 + · · ·
+       At = δt + γλAt+1
+       δt = rt + γV(s') - V(s)
+    """
     # ############TODO#############
     gae = 0
     gae_returns = []
@@ -289,24 +296,24 @@ class PPOAgent:
             log_prob = dist.log_prob(action)
             ratio = (log_prob - old_log_prob).exp()          
 
-            # # actor_loss
-            # ############TODO#############
-            # # actor_loss = ?
+            # actor_loss
+            ############TODO#############
+            # actor_loss =  -min (ρ(θ)A(s, a), clip (ρ(θ), 1 − ϵ, 1 + ϵ) A(s, a))
             surrogate = ratio * adv
             clipped_surrogate = torch.clamp(ratio, 1-self.epsilon, 1+self.epsilon)* adv
             
             entropy = dist.entropy().mean()
             actor_loss = (-torch.min(surrogate, clipped_surrogate)).mean() - self.entropy_weight*entropy          
             
-            # #############################
+            #############################
 
-            # # critic_loss
-            # ############TODO#############
-            # # critic_loss = ?            
+            # critic_loss
+            ############TODO#############
+            # critic_loss = ?            
             state_value = self.critic(state)
             critic_loss = F.mse_loss(state_value, return_)
             #critic_loss = F.smooth_l1_loss(state_value, return_) 
-            # #############################
+            #############################
             
             # train critic
             self.critic_optimizer.zero_grad()
@@ -333,7 +340,7 @@ class PPOAgent:
         """Train the PPO agent."""
         self.is_test = False
 
-        state, _ = self.env.reset(seed=self.seed)
+        state, _ = self.env.reset()
         state = np.expand_dims(state, axis=0)
 
         actor_losses, critic_losses = [], []
@@ -354,7 +361,7 @@ class PPOAgent:
                 # if episode ends
                 if done[0][0]:
                     episode_count += 1
-                    state, _ = self.env.reset(seed=self.seed)
+                    state, _ = self.env.reset()
                     state = np.expand_dims(state, axis=0)
                     scores.append(score)
                     print(f"Episode {episode_count}: Total Reward = {score}")
@@ -386,14 +393,15 @@ class PPOAgent:
         # termination
         self.env.close()
 
-    def test(self, video_folder: str):
+    def test(self, video_folder: str, seed: int):
         """Test the agent."""
         self.is_test = True
 
+        name_prefix = f"seed_{seed}"
         tmp_env = self.env
-        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder)
+        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder, name_prefix=name_prefix)
 
-        state, _ = self.env.reset(seed=self.seed)
+        state, _ = self.env.reset(seed=seed)
         done = False
         score = 0
 
@@ -406,8 +414,9 @@ class PPOAgent:
 
         print("score: ", score[0][0])
         self.env.close()
-
         self.env = tmp_env
+        return score[0][0]
+        
     
     def load_best_model(self, save_dir: str):
         actor_path = os.path.join(save_dir, "actor_best.pt")
@@ -422,6 +431,15 @@ def seed_torch(seed):
     if torch.backends.cudnn.enabled:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
+
+def read_seeds_from_file(file_path: str):
+    seeds = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            match = re.match(r"Seed:\s*(\d+),\s*Reward:", line)
+            if match:
+                seeds.append(int(match.group(1)))
+    return seeds
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -438,21 +456,48 @@ if __name__ == "__main__":
     parser.add_argument("--rollout-len", type=int, default=2000)  
     parser.add_argument("--update-epoch", type=float, default=64)
     parser.add_argument("--save-dir", type=str, default="result/task2/model", help="Directory to save model checkpoints")
-    parser.add_argument("--video-dir", type=str, default="result/task2/video", help="Directory to save test videos")
+    parser.add_argument("--video-dir", type=str, default="result/task2/video_test_seed", help="Directory to save test videos")
+    parser.add_argument("--txt-dir", type=str, default="result/task2", help="Directory to save test seed")
 
     args = parser.parse_args()
  
     # environment
     env = gym.make("Pendulum-v1", render_mode="rgb_array")
-    seed = 77
+    seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     seed_torch(seed)
-    wandb.init(project="DLP-Lab7-PPO-Pendulum", name=args.wandb_run_name, save_code=True)
+    # wandb.init(project="DLP-Lab7-PPO-Pendulum", name=args.wandb_run_name, save_code=True)
     
-    agent = PPOAgent(env, args)
-    agent.train()
+    # agent = PPOAgent(env, args)
+    # agent.train()
     
+    # agent = PPOAgent(env, args)
+    # os.makedirs(args.txt_dir, exist_ok=True)
+    # result_file = os.path.join(args.txt_dir, "successful_seeds.txt")
+
+    # os.makedirs(args.video_dir, exist_ok=True)
+    # agent.load_best_model(save_dir=args.save_dir)
+
+    # success_count = 0
+    # with open(result_file, "w") as f:
+    #     for i in range(10000):
+    #         score = agent.test(video_folder=args.video_dir, seed=i)
+    #         if score > SUCCESS_REWARD_THRESHOLD:
+    #             f.write(f"Seed: {i}, Reward: {score:.2f}\n")
+    #             print(f"Success {success_count + 1}/20: Seed {i}, Reward {score:.2f}")
+    #             success_count += 1
+    #             if success_count >= NUM_SUCCESSFUL_SEEDS:
+    #                 break
+    #         else:
+    #             print(f"Failed: Seed {i}, Reward {score:.2f}")
+
     os.makedirs(args.video_dir, exist_ok=True)
+
+    agent = PPOAgent(env, args)
     agent.load_best_model(save_dir=args.save_dir)
-    agent.test(video_folder=args.video_dir)
+    file_path = "result/task2/successful_seeds.txt"
+    seeds = read_seeds_from_file(file_path)
+    for seed in seeds:
+        print(f"Testing with seed {seed}")
+        agent.test(video_folder=args.video_dir, seed=seed)

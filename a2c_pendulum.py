@@ -20,6 +20,11 @@ import wandb
 from tqdm import tqdm
 from typing import Tuple
 import os
+import re
+
+
+SUCCESS_REWARD_THRESHOLD = -150
+NUM_SUCCESSFUL_SEEDS = 20
 
 def initialize_uniformly(layer: nn.Linear, init_w: float = 3e-3):
     """Initialize the weights and bias in [-init_w, init_w]."""
@@ -28,7 +33,7 @@ def initialize_uniformly(layer: nn.Linear, init_w: float = 3e-3):
 
 
 class Actor(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 128):
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 64):
         """Initialize."""
         super(Actor, self).__init__()
         
@@ -64,7 +69,7 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 128):
+    def __init__(self, in_dim: int, hidden_dim: int = 64):
         """Initialize."""
         super(Critic, self).__init__()
         
@@ -195,11 +200,11 @@ class A2CAgent:
         mask = 1 - done
         
         ############TODO#############
-        # value_loss = ?
+        # value_loss = (r+γV(s')−V(s))**2
         td_target = reward + self.gamma* self.critic(next_state) * mask
-        state_value = self.critic(state)
-        value_loss = F.smooth_l1_loss(state_value, td_target.detach())   
-        #value_loss = F.mse_loss(state_value, td_target.detach())             
+        state_value = self.critic(state) 
+        value_loss = F.mse_loss(state_value, td_target.detach())    
+        # value_loss = F.smooth_l1_loss(state_value, td_target.detach())          
         #############################
 
         # update value
@@ -209,7 +214,7 @@ class A2CAgent:
 
         # advantage = Q_t - V(s_t)
         ############TODO#############
-        # policy_loss = ?
+        # policy_loss = -log π(a|s)(r+γV(s')−V(s))
         advantage = (td_target - state_value).detach()
         policy_loss = -(log_prob * advantage) - self.entropy_weight * log_prob
         #############################
@@ -227,7 +232,7 @@ class A2CAgent:
         
         for ep in tqdm(range(1, self.num_episodes)): 
             actor_losses, critic_losses, scores = [], [], []
-            state, _ = self.env.reset(seed=self.seed)
+            state, _ = self.env.reset()
             score = 0
             done = False
             while not done:
@@ -257,21 +262,22 @@ class A2CAgent:
                         "episode": ep,
                         "return": score
                         })  
-                    # if score >= self.best_score:
-                    #     self.best_score = score
-                    #     self.save_model(is_best=True)
+                    if score >= self.best_score:
+                        self.best_score = score
+                        self.save_model(is_best=True)
 
-                    # self.save_model(epoch=ep)
+                    self.save_model(epoch=ep)
 
 
-    def test(self, video_folder: str):
+    def test(self, video_folder: str, seed: int):
         """Test the agent."""
         self.is_test = True
 
+        name_prefix = f"seed_{seed}"
         tmp_env = self.env
-        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder)
+        self.env = gym.wrappers.RecordVideo(self.env, video_folder=video_folder, name_prefix=name_prefix)
 
-        state, _ = self.env.reset(seed=self.seed)
+        state, _ = self.env.reset(seed=seed)
         done = False
         score = 0
 
@@ -284,8 +290,8 @@ class A2CAgent:
 
         print("score: ", score)
         self.env.close()
-
         self.env = tmp_env
+        return score
         
     def load_best_model(self, save_dir: str):
         actor_path = os.path.join(save_dir, "actor_best.pt")
@@ -301,6 +307,14 @@ def seed_torch(seed):
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
 
+def read_seeds_from_file(file_path: str):
+    seeds = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            match = re.match(r"Seed:\s*(\d+),\s*Reward:", line)
+            if match:
+                seeds.append(int(match.group(1)))
+    return seeds
 
 
 if __name__ == "__main__":
@@ -314,7 +328,9 @@ if __name__ == "__main__":
     parser.add_argument("--entropy-weight", type=float, default=1e-2) # entropy can be disabled by setting this to 0
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--save-dir", type=str, default="result/task1/model", help="Directory to save model checkpoints")
-    parser.add_argument("--video-dir", type=str, default="result/task1/video", help="Directory to save test videos")
+    parser.add_argument("--video-dir", type=str, default="result/task1/video_test_seed", help="Directory to save test videos")
+    parser.add_argument("--txt-dir", type=str, default="result/task1", help="Directory to save test seed")
+
 
     args = parser.parse_args()
     
@@ -329,7 +345,34 @@ if __name__ == "__main__":
     agent = A2CAgent(env, args)
     agent.train()
     
-    # os.makedirs(args.video_dir, exist_ok=True)
-    # agent.load_best_model(save_dir=args.save_dir)
-    # agent.test(video_folder=args.video_dir)
+    # os.makedirs(args.txt_dir, exist_ok=True)
+    # result_file = os.path.join(args.txt_dir, "successful_seeds.txt")
 
+    # os.makedirs(args.video_dir, exist_ok=True)
+
+    # agent = A2CAgent(env, args)
+    # agent.load_best_model(save_dir=args.save_dir)
+
+    # success_count = 0
+    # with open(result_file, "w") as f:
+    #     for i in range(10000):
+    #         score = agent.test(video_folder=args.video_dir, seed=i)
+    #         if score > SUCCESS_REWARD_THRESHOLD:
+    #             f.write(f"Seed: {i}, Reward: {score:.2f}\n")
+    #             print(f"Success {success_count + 1}/20: Seed {i}, Reward {score:.2f}")
+    #             success_count += 1
+    #             if success_count >= NUM_SUCCESSFUL_SEEDS:
+    #                 break
+    #         else:
+    #             print(f"Failed: Seed {i}, Reward {score:.2f}")
+
+
+    # os.makedirs(args.video_dir, exist_ok=True)
+
+    # agent = A2CAgent(env, args)
+    # agent.load_best_model(save_dir=args.save_dir)
+    # file_path = "result/task1/successful_seeds.txt"
+    # seeds = read_seeds_from_file(file_path)
+    # for seed in seeds:
+    #     print(f"Testing with seed {seed}")
+    #     agent.test(video_folder=args.video_dir, seed=seed)
